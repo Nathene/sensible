@@ -1,28 +1,38 @@
-package httclient
+package httpclient
 
 import (
+	"io"
 	"net"
 	"net/http"
 	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 const (
-	defaultTimeout      = 15 * time.Second
-	defaultIdleTimeout  = 30 * time.Second
-	defaultRetryMax     = 3
-	defaultRetryWaitMin = 1 * time.Second
-	defaultRetryWaitMax = 15 * time.Second
-	defaultMaxIdleConns = 5
-	defaultTLSHandshake = 5 * time.Second
-	defaultKeepAlive    = 10 * time.Second
+	defaultTimeout         = 15 * time.Second
+	defaultIdleTimeout     = 30 * time.Second
+	defaultRetryMax        = 3
+	defaultRetryWaitMin    = 1 * time.Second
+	defaultRetryWaitMax    = 15 * time.Second
+	defaultMaxIdleConns    = 5
+	defaultTLSHandshake    = 5 * time.Second
+	defaultKeepAlive       = 10 * time.Second
+	defaultMaxResponseSize = 1024 * 1024 // 1MB default max response size
 )
 
-// Client wraps the standard http.Client with sensible defaults and retry capability
+// Client wraps the standard http.Client with sensible defaults and retry capability.
+// It provides:
+// - Configurable retry behavior with exponential backoff for rate limits
+// - Constant backoff for server errors
+// - Context cancellation support
+// - Connection pooling with sensible defaults
 type Client struct {
 	*http.Client
-	retryMax     int
-	retryWaitMin time.Duration
-	retryWaitMax time.Duration
+	retryMax        int           // Maximum number of retry attempts
+	retryWaitMin    time.Duration // Minimum time to wait between retries
+	retryWaitMax    time.Duration // Maximum time to wait between retries
+	maxResponseSize int64         // Maximum response size in bytes
 }
 
 // New creates a new HTTP client with sensible defaults
@@ -39,14 +49,18 @@ func New(opts ...Option) *Client {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
+	// Wrap the transport with OTEL
+	tracedTransport := otelhttp.NewTransport(transport)
+
 	c := &Client{
 		Client: &http.Client{
-			Transport: transport,
+			Transport: tracedTransport,
 			Timeout:   defaultTimeout,
 		},
-		retryMax:     defaultRetryMax,
-		retryWaitMin: defaultRetryWaitMin,
-		retryWaitMax: defaultRetryWaitMax,
+		retryMax:        defaultRetryMax,
+		retryWaitMin:    defaultRetryWaitMin,
+		retryWaitMax:    defaultRetryWaitMax,
+		maxResponseSize: defaultMaxResponseSize,
 	}
 
 	// Apply any custom options
@@ -78,11 +92,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			case <-time.After(wait):
 			}
 
-			// Exponential backoff
-			wait *= 2
-			if wait > c.retryWaitMax {
-				wait = c.retryWaitMax
-			}
+			wait = c.getNextWait(0, wait)
 			continue
 		}
 
@@ -94,12 +104,12 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 				return nil, req.Context().Err()
 			case <-time.After(wait):
 			}
-			wait *= 2
-			if wait > c.retryWaitMax {
-				wait = c.retryWaitMax
-			}
+			wait = c.getNextWait(resp.StatusCode, wait)
 			continue
 		}
+
+		// Wrap the response body with a limited reader
+		resp.Body = c.LimitedReader(resp.Body)
 
 		return resp, nil
 	}
@@ -109,10 +119,18 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 
 // shouldRetry returns true if the status code indicates a retriable error
 func shouldRetry(statusCode int) bool {
-	return statusCode == http.StatusTooManyRequests ||
-		statusCode == http.StatusServiceUnavailable ||
-		statusCode == http.StatusGatewayTimeout ||
-		statusCode == http.StatusBadGateway
+	switch statusCode {
+	case http.StatusTooManyRequests: // 429 - Use exponential backoff
+		return true
+	case http.StatusServiceUnavailable: // 503
+		return true
+	case http.StatusGatewayTimeout: // 504
+		return true
+	case http.StatusBadGateway: // 502
+		return true
+	default:
+		return false
+	}
 }
 
 // Option allows customization of the client
@@ -149,6 +167,50 @@ func WithRetryWaitMax(max time.Duration) Option {
 // WithMaxIdleConns sets the maximum number of idle connections
 func WithMaxIdleConns(max int) Option {
 	return func(c *Client) {
-		c.Transport.(*http.Transport).MaxIdleConns = max
+		if t, ok := c.Transport.(*http.Transport); ok {
+			t.MaxIdleConns = max
+		}
 	}
+}
+
+// WithMaxResponseSize sets maximum response size
+func WithMaxResponseSize(maxBytes int64) Option {
+	return func(c *Client) {
+		c.maxResponseSize = maxBytes
+	}
+}
+
+// LimitedReader wraps response body with size limit
+func (c *Client) LimitedReader(body io.ReadCloser) io.ReadCloser {
+	return &limitedReadCloser{
+		R: io.LimitReader(body, c.maxResponseSize),
+		C: body,
+	}
+}
+
+type limitedReadCloser struct {
+	R io.Reader
+	C io.Closer
+}
+
+func (l *limitedReadCloser) Read(p []byte) (n int, err error) {
+	return l.R.Read(p)
+}
+
+func (l *limitedReadCloser) Close() error {
+	return l.C.Close()
+}
+
+func (c *Client) getNextWait(statusCode int, currentWait time.Duration) time.Duration {
+	// Only use exponential backoff for rate limiting
+	if statusCode == http.StatusTooManyRequests {
+		wait := currentWait * 2
+		if wait > c.retryWaitMax {
+			return c.retryWaitMax
+		}
+		return wait
+	}
+
+	// Use constant backoff for other retriable errors
+	return c.retryWaitMin
 }
