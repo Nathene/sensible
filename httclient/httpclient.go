@@ -21,6 +21,13 @@ const (
 	defaultMaxResponseSize = 1024 * 1024 // 1MB default max response size
 )
 
+type BackoffStrategy int
+
+const (
+	ConstantBackoff BackoffStrategy = iota
+	ExponentialBackoff
+)
+
 // Client wraps the standard http.Client with sensible defaults and retry capability.
 // It provides:
 // - Configurable retry behavior with exponential backoff for rate limits
@@ -33,6 +40,7 @@ type Client struct {
 	retryWaitMin    time.Duration // Minimum time to wait between retries
 	retryWaitMax    time.Duration // Maximum time to wait between retries
 	maxResponseSize int64         // Maximum response size in bytes
+	backoffStrategy map[int]BackoffStrategy
 }
 
 // New creates a new HTTP client with sensible defaults
@@ -61,6 +69,12 @@ func New(opts ...Option) *Client {
 		retryWaitMin:    defaultRetryWaitMin,
 		retryWaitMax:    defaultRetryWaitMax,
 		maxResponseSize: defaultMaxResponseSize,
+		backoffStrategy: map[int]BackoffStrategy{
+			http.StatusTooManyRequests:    ExponentialBackoff,
+			http.StatusServiceUnavailable: ConstantBackoff,
+			http.StatusGatewayTimeout:     ConstantBackoff,
+			http.StatusBadGateway:         ConstantBackoff,
+		},
 	}
 
 	// Apply any custom options
@@ -180,6 +194,37 @@ func WithMaxResponseSize(maxBytes int64) Option {
 	}
 }
 
+func WithBackoffStrategy(statusCode int, strategy BackoffStrategy) Option {
+	return func(c *Client) {
+		if c.backoffStrategy == nil {
+			c.backoffStrategy = make(map[int]BackoffStrategy)
+		}
+		c.backoffStrategy[statusCode] = strategy
+	}
+}
+
+func (c *Client) getNextWait(statusCode int, currentWait time.Duration) time.Duration {
+	// Get configured strategy for this status code
+	strategy, exists := c.backoffStrategy[statusCode]
+	if !exists {
+		// Default to constant backoff if no strategy configured
+		return c.retryWaitMin
+	}
+
+	switch strategy {
+	case ExponentialBackoff:
+		wait := currentWait * 2
+		if wait > c.retryWaitMax {
+			return c.retryWaitMax
+		}
+		return wait
+	case ConstantBackoff:
+		return c.retryWaitMin
+	default:
+		return c.retryWaitMin
+	}
+}
+
 // LimitedReader wraps response body with size limit
 func (c *Client) LimitedReader(body io.ReadCloser) io.ReadCloser {
 	return &limitedReadCloser{
@@ -199,18 +244,4 @@ func (l *limitedReadCloser) Read(p []byte) (n int, err error) {
 
 func (l *limitedReadCloser) Close() error {
 	return l.C.Close()
-}
-
-func (c *Client) getNextWait(statusCode int, currentWait time.Duration) time.Duration {
-	// Only use exponential backoff for rate limiting
-	if statusCode == http.StatusTooManyRequests {
-		wait := currentWait * 2
-		if wait > c.retryWaitMax {
-			return c.retryWaitMax
-		}
-		return wait
-	}
-
-	// Use constant backoff for other retriable errors
-	return c.retryWaitMin
 }
