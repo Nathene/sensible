@@ -21,6 +21,8 @@ const (
 	defaultMaxResponseSize = 1024 * 1024 // 1MB default max response size
 )
 
+// BackoffStrategy defines the type of backoff strategy to use
+// similar to how the net/http handles status codes.
 type BackoffStrategy int
 
 const (
@@ -44,6 +46,7 @@ type Client struct {
 }
 
 // New creates a new HTTP client with sensible defaults
+// and if provided with any Option functions, applies them
 func New(opts ...Option) *Client {
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
@@ -86,6 +89,7 @@ func New(opts ...Option) *Client {
 }
 
 // Do wraps http.Client's Do method with retry capability
+// It attempts to send an HTTP request and retries based on the status code
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	var resp *http.Response
 	var err error
@@ -147,7 +151,7 @@ func shouldRetry(statusCode int) bool {
 	}
 }
 
-// Option allows customization of the client
+// Option allows customization of the Client
 type Option func(*Client)
 
 // WithTimeout sets the client timeout
@@ -194,6 +198,7 @@ func WithMaxResponseSize(maxBytes int64) Option {
 	}
 }
 
+// WithBackoffStrategy sets the backoff strategy for a specific status code
 func WithBackoffStrategy(statusCode int, strategy BackoffStrategy) Option {
 	return func(c *Client) {
 		if c.backoffStrategy == nil {
@@ -203,6 +208,9 @@ func WithBackoffStrategy(statusCode int, strategy BackoffStrategy) Option {
 	}
 }
 
+// getNextWait calculates the next wait time based on the current wait time and status code
+// It uses the configured backoff strategy for the status code
+// If no strategy is configured, it defaults to constant backoff
 func (c *Client) getNextWait(statusCode int, currentWait time.Duration) time.Duration {
 	// Get configured strategy for this status code
 	strategy, exists := c.backoffStrategy[statusCode]
@@ -226,6 +234,10 @@ func (c *Client) getNextWait(statusCode int, currentWait time.Duration) time.Dur
 }
 
 // LimitedReader wraps response body with size limit
+// This method takes an io.ReadCloser (response body)
+// and returns a new io.ReadCloser with a limited reader to limit the size of the response payload.
+// This is useful to prevent reading large response payloads into memory.
+// This can also be configured via WithMaxResponseSize option.
 func (c *Client) LimitedReader(body io.ReadCloser) io.ReadCloser {
 	return &limitedReadCloser{
 		R: io.LimitReader(body, c.maxResponseSize),
@@ -233,15 +245,21 @@ func (c *Client) LimitedReader(body io.ReadCloser) io.ReadCloser {
 	}
 }
 
+// limitedReadCloser is a wrapper around an io.Reader and io.Closer
+// It ensures that the response body is limited to a certain size and closed after reading.
 type limitedReadCloser struct {
-	R io.Reader
-	C io.Closer
+	R io.Reader // the limited reader that restricts the amount of data that can be read
+	C io.Closer // the original response body that will be closed after reading
 }
 
+// Read reads data into p from the limited reader
+// It implements the Read method of the io.Reader Interface
 func (l *limitedReadCloser) Read(p []byte) (n int, err error) {
 	return l.R.Read(p)
 }
 
+// Close closes the original io.Closer
+// It implements the Close method of the io.Closer Interface
 func (l *limitedReadCloser) Close() error {
 	return l.C.Close()
 }
