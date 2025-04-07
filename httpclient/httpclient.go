@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
 )
 
 const (
@@ -91,14 +92,20 @@ func New(opts ...Option) *Client {
 // Do wraps http.Client's Do method with retry capability
 // It attempts to send an HTTP request and retries based on the status code
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
-	var resp *http.Response
-	var err error
+	tracer := otel.Tracer("httpclient")
+	ctx, span := tracer.Start(req.Context(), "httpclient.Do")
+	defer span.End()
+	req = req.WithContext(ctx)
 
 	wait := c.retryWaitMin
 
-	for i := 0; i <= c.retryMax; i++ {
-		resp, err = c.Client.Do(req)
+	for i := range c.retryMax {
+		resp, err := c.Client.Do(req)
 
+		_, ok := c.backoffStrategy[resp.StatusCode]
+		if err == nil && !ok {
+			break
+		}
 		if err != nil {
 			if i == c.retryMax {
 				return nil, err
@@ -110,45 +117,23 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			case <-time.After(wait):
 			}
 
-			wait = c.getNextWait(0, wait)
-			continue
-		}
-
-		// Check if we should retry based on status code
-		if shouldRetry(resp.StatusCode) && i < c.retryMax {
-			resp.Body.Close()
-			select {
-			case <-req.Context().Done():
-				return nil, req.Context().Err()
-			case <-time.After(wait):
-			}
 			wait = c.getNextWait(resp.StatusCode, wait)
 			continue
 		}
 
-		// Wrap the response body with a limited reader
-		resp.Body = c.LimitedReader(resp.Body)
-
-		return resp, nil
+		if ok {
+			switch c.backoffStrategy[resp.StatusCode] {
+			case ConstantBackoff:
+				wait = c.retryWaitMin
+			case ExponentialBackoff:
+				wait *= 2
+				if wait > c.retryWaitMax {
+					wait = c.retryWaitMax
+				}
+			}
+		}
 	}
-
-	return resp, err
-}
-
-// shouldRetry returns true if the status code indicates a retriable error
-func shouldRetry(statusCode int) bool {
-	switch statusCode {
-	case http.StatusTooManyRequests: // 429 - Use exponential backoff
-		return true
-	case http.StatusServiceUnavailable: // 503
-		return true
-	case http.StatusGatewayTimeout: // 504
-		return true
-	case http.StatusBadGateway: // 502
-		return true
-	default:
-		return false
-	}
+	return c.Client.Do(req)
 }
 
 // Option allows customization of the Client
@@ -240,26 +225,29 @@ func (c *Client) getNextWait(statusCode int, currentWait time.Duration) time.Dur
 // This can also be configured via WithMaxResponseSize option.
 func (c *Client) LimitedReader(body io.ReadCloser) io.ReadCloser {
 	return &limitedReadCloser{
-		R: io.LimitReader(body, c.maxResponseSize),
-		C: body,
+		io.LimitReader(body, c.maxResponseSize),
+		body,
 	}
 }
 
 // limitedReadCloser is a wrapper around an io.Reader and io.Closer
 // It ensures that the response body is limited to a certain size and closed after reading.
 type limitedReadCloser struct {
-	R io.Reader // the limited reader that restricts the amount of data that can be read
-	C io.Closer // the original response body that will be closed after reading
+	io.Reader // the limited reader that restricts the amount of data that can be read
+	io.Closer // the original response body that will be closed after reading
 }
 
 // Read reads data into p from the limited reader
 // It implements the Read method of the io.Reader Interface
 func (l *limitedReadCloser) Read(p []byte) (n int, err error) {
-	return l.R.Read(p)
+	if lr, ok := l.Reader.(*io.LimitedReader); ok {
+		return lr.Read(p)
+	}
+	return 0, io.ErrUnexpectedEOF
 }
 
 // Close closes the original io.Closer
 // It implements the Close method of the io.Closer Interface
 func (l *limitedReadCloser) Close() error {
-	return l.C.Close()
+	return l.Closer.Close()
 }
